@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join, posix, win32 } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { configureDesktopIdentity } from '../../packages/desktop/src/main/desktop-identity'
+import { restoreEnv } from '../mocks/env'
 
 describe('desktop identity across the Ekko Studio rename', () => {
   it.each([
@@ -75,7 +76,7 @@ describe('portable desktop identity', () => {
   })
 
   afterEach(() => {
-    process.env = { ...savedEnv }
+    restoreEnv(savedEnv)
     rmSync(base, { recursive: true, force: true })
   })
 

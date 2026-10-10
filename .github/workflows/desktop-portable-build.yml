@@ -73,27 +73,50 @@ jobs:
       - name: Assemble the green folder
         shell: pwsh
         run: |
-          $release = "packages/desktop/release"
+          $release = (Resolve-Path packages/desktop/release).Path
           $version = (Get-Content packages/desktop/package.json -Raw | ConvertFrom-Json).version
-          $folder = "$release/EkkoStudio-Portable"
+          $folder = Join-Path $release "EkkoStudio-Portable"
 
           if (Test-Path $folder) { Remove-Item $folder -Recurse -Force }
-          Move-Item "$release/win-unpacked" $folder
+          Move-Item (Join-Path $release "win-unpacked") $folder
 
           # This directory is the portable marker: isPortableMode() looks for
           # `data/` next to the exe and redirects every write below it.
-          New-Item -ItemType Directory -Force -Path "$folder/data" | Out-Null
-          Set-Content -Path "$folder/data/.keep" `
+          New-Item -ItemType Directory -Force -Path (Join-Path $folder "data") | Out-Null
+          Set-Content -Path (Join-Path $folder "data/.keep") `
             -Value "This folder is what makes Ekko Studio portable. Everything the app writes stays here."
 
-          $zip = "$release/EkkoStudio-Portable-$version-win-x64.zip"
+          $zip = Join-Path $release "EkkoStudio-Portable-$version-win-x64.zip"
           if (Test-Path $zip) { Remove-Item $zip -Force }
-          # 7z rather than Compress-Archive: the unpacked Electron tree routinely
-          # exceeds MAX_PATH, which the .NET zip writer refuses.
-          7z a -tzip -mx=5 $zip $folder
+
+          # Archive from the parent so stored names start at EkkoStudio-Portable/,
+          # and with 7z rather than Compress-Archive: the unpacked Electron tree
+          # routinely exceeds MAX_PATH, which the .NET zip writer refuses.
+          Push-Location $release
+          try { 7z a -tzip -mx=5 (Split-Path $zip -Leaf) "EkkoStudio-Portable" } finally { Pop-Location }
 
           Get-ChildItem $folder -Name
           Get-Item $zip | Select-Object Name, Length
+
+      - name: Verify the archive is self-contained
+        shell: pwsh
+        run: |
+          $zip = (Get-ChildItem packages/desktop/release/EkkoStudio-Portable-*-win-x64.zip).FullName
+          $names = 7z l -slt $zip |
+            Select-String "^Path = " |
+            ForEach-Object { $_.Line.Substring("Path = ".Length) -replace "\\", "/" } |
+            Where-Object { $_ -and $_ -notlike "*.zip" }
+          "archive entries: $($names.Count)"
+
+          # The app only stays portable while the exe and the data directory are
+          # siblings inside one top-level folder.
+          foreach ($required in @("EkkoStudio-Portable/Ekko Studio.exe", "EkkoStudio-Portable/data/.keep")) {
+            if ($names -notcontains $required) { throw "portable archive is missing $required" }
+            "ok: $required"
+          }
+          $stray = $names | Where-Object { $_ -notlike "EkkoStudio-Portable/*" }
+          if ($stray) { throw "entries outside the program folder: $($stray -join ", ")" }
+          "ok: every entry lives under EkkoStudio-Portable/"
 
       - name: Upload portable artifact
         uses: actions/upload-artifact@v4

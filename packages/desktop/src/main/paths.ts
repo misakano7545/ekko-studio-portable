@@ -49,6 +49,35 @@ export function isPortableMode(): boolean {
   return isPackaged() && existsSync(join(portableBaseDir(), 'data'))
 }
 
+export type PortableConfig = {
+  dataDir?: unknown
+  port?: unknown
+}
+
+export function readPortableConfig(base: string): PortableConfig {
+  const file = join(base, 'config.json')
+  if (!existsSync(file)) return {}
+  try {
+    return JSON.parse(readFileSync(file, 'utf-8')) as PortableConfig
+  } catch (err) {
+    // Swallowing this silently means a typo in config.json looks like the
+    // setting simply has no effect, and the data lands in the default folder.
+    console.warn(`[desktop] ignoring unreadable ${file}: ${err instanceof Error ? err.message : String(err)}`)
+    return {}
+  }
+}
+
+export function dataRootForPortableConfig(base: string, config: PortableConfig): string {
+  const dataDir = typeof config.dataDir === 'string' ? config.dataDir.trim() : ''
+  // Calibration knob, not a feature: USB sticks have terrible random-write
+  // throughput (SQLite plus logs stall on USB 2.0), so an operator can point the
+  // data root at a local disk. The default stays inside the program folder.
+  //
+  // Resolved against the program folder, never the cwd: a shortcut, a USB drive
+  // and an AppImage all launch with an arbitrary working directory.
+  return dataDir ? resolve(base, dataDir) : join(base, 'data')
+}
+
 export function defaultWebuiDir(): string {
   if (isPackaged()) return resolve(process.resourcesPath, 'webui')
   return process.env.HERMES_WEB_UI_DIR?.trim() || resolve(app?.getAppPath?.() || resolve(process.cwd(), 'packages', 'desktop'), '..', '..')
@@ -182,30 +211,36 @@ const PORTABLE_PATH_KEYS = [
 ] as const
 
 /**
- * A portable install only ever addresses files inside its own directory, so a
- * recorded absolute path that no longer sits there is stale — the drive letter
- * or the folder moved.
+ * A copy of the app only ever addresses files inside its own folder — the
+ * program folder, plus the data root when config.json points it at a local disk
+ * (the reason that knob exists). A recorded absolute path outside both is stale:
+ * the drive letter or the folder moved.
  *
  * Dropping those keys makes the directory get re-derived from the current
- * location. Keeping them is what strands a perfectly good multi-gigabyte
- * runtime after a drive-letter change: every lookup points at the previous
- * location, `runtimeReady()` reports false, and the relocation repair is
- * short-circuited because it is handed the same dead path.
+ * location. Keeping a dead one strands a multi-gigabyte runtime: every lookup
+ * points at the previous location and the relocation repair is handed the same
+ * dead path.
  *
  * One guard here covers all four callers, because this is the single place the
  * file is read.
  */
 function dropPathsOutsidePortableBase(active: ActiveRuntimeVersion): ActiveRuntimeVersion {
   const base = resolve(portableBaseDir())
-  const insideBase = (value: unknown): boolean => {
+  const dataRoot = resolve(dataRootForPortableConfig(base, readPortableConfig(base)))
+  const boundaries = dataRoot === base ? [base] : [base, dataRoot]
+  const isInside = (value: unknown): boolean => {
     if (typeof value !== 'string' || !value.trim()) return false
     const resolved = resolve(value.trim())
-    return resolved === base || resolved.startsWith(base + sep)
+    return boundaries.some(boundary => resolved === boundary || resolved.startsWith(boundary + sep))
   }
 
   const portable: ActiveRuntimeVersion = { ...active }
   for (const key of PORTABLE_PATH_KEYS) {
-    if (typeof portable[key] === 'string' && !insideBase(portable[key])) delete portable[key]
+    const value = portable[key]
+    if (typeof value === 'string' && !isInside(value)) {
+      delete portable[key]
+      console.warn(`[desktop] dropped recorded ${key} outside the portable folder: ${value}`)
+    }
   }
   return portable
 }

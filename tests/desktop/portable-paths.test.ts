@@ -9,6 +9,7 @@ import {
   runtimeStorageRoot,
 } from '../../packages/desktop/src/main/paths'
 import { dataRootForPortableConfig } from '../../packages/desktop/src/main/desktop-identity'
+import { restoreEnv } from '../mocks/env'
 
 // Absolute everywhere and never inside the portable base — the shape a previous
 // drive letter or a moved folder leaves behind in active-version.json. Built with
@@ -30,7 +31,7 @@ describe('portable runtime paths', () => {
   })
 
   afterEach(() => {
-    process.env = { ...savedEnv }
+    restoreEnv(savedEnv)
     ;(app as { isPackaged: boolean }).isPackaged = false
     rmSync(base, { recursive: true, force: true })
   })

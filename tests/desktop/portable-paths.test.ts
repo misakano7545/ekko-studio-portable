@@ -1,6 +1,6 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { app } from 'electron'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
@@ -10,9 +10,11 @@ import {
 } from '../../packages/desktop/src/main/paths'
 import { dataRootForPortableConfig } from '../../packages/desktop/src/main/desktop-identity'
 
-// A path that is absolute on every platform but never inside the portable base.
-// On Windows this is a drive letter the folder no longer sits on.
-const PREVIOUS_LOCATION = '/mnt/old-drive/EkkoStudio/data/web-ui/desktop-runtime'
+// Absolute everywhere and never inside the portable base — the shape a previous
+// drive letter or a moved folder leaves behind in active-version.json. Built with
+// join() rather than a POSIX literal so it stays absolute on Windows too.
+const PROGRAM_FOLDER = join(tmpdir(), 'ekko-program-folder')
+const PREVIOUS_LOCATION = join(tmpdir(), 'old-drive', 'EkkoStudio', 'data', 'web-ui', 'desktop-runtime')
 
 describe('portable runtime paths', () => {
   const savedEnv = { ...process.env }
@@ -91,15 +93,16 @@ describe('portable runtime paths', () => {
 
 describe('portable data root', () => {
   it('defaults to data/ inside the program folder', () => {
-    expect(dataRootForPortableConfig('/media/usb/EkkoStudio', {})).toBe('/media/usb/EkkoStudio/data')
+    expect(dataRootForPortableConfig(PROGRAM_FOLDER, {})).toBe(join(PROGRAM_FOLDER, 'data'))
   })
 
   it('honours a configured data directory', () => {
-    expect(dataRootForPortableConfig('/media/usb/EkkoStudio', { dataDir: '/var/ekko' })).toBe('/var/ekko')
+    const local = join(tmpdir(), 'ekko-local-disk')
+    expect(dataRootForPortableConfig(PROGRAM_FOLDER, { dataDir: local })).toBe(resolve(local))
   })
 
   it('ignores a blank or non-string data directory', () => {
-    expect(dataRootForPortableConfig('/media/usb/EkkoStudio', { dataDir: '  ' })).toBe('/media/usb/EkkoStudio/data')
-    expect(dataRootForPortableConfig('/media/usb/EkkoStudio', { dataDir: 7 })).toBe('/media/usb/EkkoStudio/data')
+    expect(dataRootForPortableConfig(PROGRAM_FOLDER, { dataDir: '  ' })).toBe(join(PROGRAM_FOLDER, 'data'))
+    expect(dataRootForPortableConfig(PROGRAM_FOLDER, { dataDir: 7 })).toBe(join(PROGRAM_FOLDER, 'data'))
   })
 })

@@ -114,7 +114,8 @@ jobs:
             if ($names -notcontains $required) { throw "portable archive is missing $required" }
             "ok: $required"
           }
-          $stray = $names | Where-Object { $_ -notlike "EkkoStudio-Portable/*" }
+          # 7z also records the top-level folder itself, without a trailing slash.
+          $stray = $names | Where-Object { $_ -ne "EkkoStudio-Portable" -and $_ -notlike "EkkoStudio-Portable/*" }
           if ($stray) { throw "entries outside the program folder: $($stray -join ", ")" }
           "ok: every entry lives under EkkoStudio-Portable/"
 

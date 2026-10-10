@@ -1,6 +1,6 @@
 import { app } from 'electron'
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
-import { basename, dirname, join, relative, resolve } from 'node:path'
+import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import { homedir, platform } from 'node:os'
 import {
   resolveRuntimeResourceDir,
@@ -17,6 +17,36 @@ let incompleteActiveWebUiWarningPath = ''
 
 export function isPackaged() {
   return !!app?.isPackaged
+}
+
+/**
+ * Root of a green install: the directory that holds the executable. Everything
+ * a portable install writes lives underneath it.
+ *
+ * `process.cwd()` is deliberately not used — a shortcut, a USB drive and an
+ * AppImage all launch the app with an arbitrary working directory, so the
+ * program folder would be misidentified and state written to the wrong place.
+ */
+export function portableBaseDir(): string {
+  const override = process.env.HERMES_DESKTOP_PORTABLE_DIR?.trim()
+  if (override) return resolve(override)
+  if (process.env.APPIMAGE) return dirname(resolve(process.env.APPIMAGE))
+  return dirname(process.execPath)
+}
+
+/**
+ * Portable mode is opt-in: the folder ships with a `data/` directory next to the
+ * executable, and the presence of that directory *is* the marker — no separate
+ * flag file. A copy of the app that is missing `data/` (an installed build in
+ * Program Files, a dev checkout) is not portable and behaves as before.
+ *
+ * The environment variable wins so development builds and tests can exercise the
+ * portable paths without a packaged application.
+ */
+export function isPortableMode(): boolean {
+  const flag = process.env.HERMES_DESKTOP_PORTABLE?.trim().toLowerCase()
+  if (flag) return !['0', 'false', 'no', 'off'].includes(flag)
+  return isPackaged() && existsSync(join(portableBaseDir(), 'data'))
 }
 
 export function defaultWebuiDir(): string {
@@ -137,10 +167,47 @@ function readActiveRuntimeVersion(): ActiveRuntimeVersion | null {
   const file = activeRuntimeVersionFile()
   if (!existsSync(file)) return null
   try {
-    return JSON.parse(readFileSync(file, 'utf-8')) as ActiveRuntimeVersion
+    const active = JSON.parse(readFileSync(file, 'utf-8')) as ActiveRuntimeVersion
+    return isPortableMode() ? dropPathsOutsidePortableBase(active) : active
   } catch {
     return null
   }
+}
+
+const PORTABLE_PATH_KEYS = [
+  'runtimeDirectory',
+  'runtimeRootDirectory',
+  'pendingRuntimeRootDirectory',
+  'webUiDirectory',
+] as const
+
+/**
+ * A portable install only ever addresses files inside its own directory, so a
+ * recorded absolute path that no longer sits there is stale — the drive letter
+ * or the folder moved.
+ *
+ * Dropping those keys makes the directory get re-derived from the current
+ * location. Keeping them is what strands a perfectly good multi-gigabyte
+ * runtime after a drive-letter change: every lookup points at the previous
+ * location, `runtimeReady()` reports false, and the relocation repair is
+ * short-circuited because it is handed the same dead path.
+ *
+ * One guard here covers all four callers, because this is the single place the
+ * file is read.
+ */
+function dropPathsOutsidePortableBase(active: ActiveRuntimeVersion): ActiveRuntimeVersion {
+  const base = resolve(portableBaseDir())
+  const insideBase = (value: unknown): boolean => {
+    if (typeof value !== 'string' || !value.trim()) return false
+    const resolved = resolve(value.trim())
+    return resolved === base || resolved.startsWith(base + sep)
+  }
+
+  const portable: ActiveRuntimeVersion = { ...active }
+  for (const key of PORTABLE_PATH_KEYS) {
+    if (typeof portable[key] === 'string' && !insideBase(portable[key])) delete portable[key]
+  }
+  return portable
 }
 
 export function recordRuntimeActivationError(error: string): void {

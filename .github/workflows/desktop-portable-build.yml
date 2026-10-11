@@ -35,7 +35,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: desktop-portable-${{ github.ref }}
+  # Keyed on the event too: a push to main must never cancel a run that is
+  # mid-publish. Duplicate pushes still cancel each other.
+  group: desktop-portable-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 env:
@@ -249,7 +251,10 @@ jobs:
           - EkkoStudio-Portable-Full-$tag-win-x64.zip - 运行时已内置，可离线运行（约 862 MiB）
 
           解压后运行 EkkoStudio-Portable/Ekko Studio.exe，数据写在同级 data/ 目录。"
-          gh release create "$tag" ./*.zip \
+          # Draft first, publish only once both zips are attached: a run killed
+          # mid-upload leaves an invisible draft, not a half-full release.
+          gh release create "$tag" ./*.zip --draft \
             --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "$tag" --notes "$notes"
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false
           echo "released https://github.com/$GITHUB_REPOSITORY/releases/tag/$tag"

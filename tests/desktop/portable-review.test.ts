@@ -108,7 +108,9 @@ describe('portable review findings', () => {
   })
 
   it('greys out the tray login-item toggle and reports it off, instead of no-opping a click', () => {
-    const main = readFileSync(resolve('packages/desktop/src/main/index.ts'), 'utf8')
+    // Normalize line endings: a Windows checkout hands us CRLF, and the second
+    // pattern spans a line break.
+    const main = readFileSync(resolve('packages/desktop/src/main/index.ts'), 'utf8').replace(/\r\n/g, '\n')
 
     // Source-level because the tray template is built inside the Electron entry,
     // which cannot be imported here. Matches how tray-icon.test.ts checks it.

@@ -353,6 +353,9 @@ function hasQuitRequest(data: unknown): boolean {
 }
 
 function getOpenAtLogin(): boolean {
+  // A portable copy manages no login item, and reading one would touch the very
+  // registry this copy exists to stay out of.
+  if (isPortableMode()) return false
   try {
     return readOpenAtLogin(app)
   } catch (error) {
@@ -475,7 +478,9 @@ function updateTrayMenu() {
     {
       label: t('tray.openAtLogin'),
       type: 'checkbox',
-      enabled: process.platform !== 'linux' || app.isPackaged,
+      // Greyed out rather than hidden: the row stays discoverable, and a click
+      // could not do anything anyway — there is no login item to write.
+      enabled: (process.platform !== 'linux' || app.isPackaged) && !isPortableMode(),
       checked: getOpenAtLogin(),
       click: (item) => {
         try {

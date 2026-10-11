@@ -3,7 +3,14 @@ name: Portable Desktop Build
 # Debug loop for the green/portable build: push to a portable* branch (or run it
 # by hand), download the zip from the run artifacts, unzip it anywhere on a
 # Windows box and launch the exe. There is no installer and no release: this job
-# only produces the folder-in-a-zip artifact.
+# only produces the folder-in-a-zip artifacts.
+#
+# Two variants, same app code — build-config only:
+#   slim  the app downloads the ~536MB runtime into data/ on first launch.
+#   full  the runtime is already inside data/, so it runs with no network at all.
+# They differ by one step and one compression level; the folder layout is
+# identical, so whichever zip a user unzips, the marker and data root are the
+# same `data/` directory next to the exe.
 
 on:
   workflow_dispatch:
@@ -23,10 +30,29 @@ concurrency:
   group: desktop-portable-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Must match DEFAULT_RUNTIME_GITHUB_REPO in
+  # packages/desktop/src/main/runtime-manager.ts, which is where the app itself
+  # would fetch a runtime from.
+  RUNTIME_REPO: EKKOLearnAI/ekko-studio
+
 jobs:
   portable:
-    name: Portable Windows x64 (slim)
+    name: Portable Windows x64 (${{ matrix.variant }})
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: slim
+            suffix: ""
+            # Source plus a built web UI, so worth compressing.
+            mx: 5
+          - variant: full
+            suffix: "-Full"
+            # ~1.5GB of already-compressed binaries: deflate has nothing left to
+            # squeeze, and -mx=5 would spend minutes to save a few percent.
+            mx: 1
 
     steps:
       - name: Checkout repository
@@ -74,7 +100,6 @@ jobs:
         shell: pwsh
         run: |
           $release = (Resolve-Path packages/desktop/release).Path
-          $version = (Get-Content packages/desktop/package.json -Raw | ConvertFrom-Json).version
           $folder = Join-Path $release "EkkoStudio-Portable"
 
           if (Test-Path $folder) { Remove-Item $folder -Recurse -Force }
@@ -86,22 +111,58 @@ jobs:
           Set-Content -Path (Join-Path $folder "data/.keep") `
             -Value "This folder is what makes Ekko Studio portable. Everything the app writes stays here."
 
-          $zip = Join-Path $release "EkkoStudio-Portable-$version-win-x64.zip"
+      - name: Bundle the Hermes runtime
+        if: matrix.variant == 'full'
+        shell: pwsh
+        run: |
+          $release = Get-Content packages/desktop/build/runtime-release.json -Raw | ConvertFrom-Json
+          $base = "https://github.com/$env:RUNTIME_REPO/releases/download/$($release.tag)"
+          $manifest = Invoke-RestMethod "$base/hermes-runtime-win-x64.json"
+
+          $pkg = Join-Path $env:RUNNER_TEMP $manifest.asset.name
+          curl.exe -L --fail --silent --show-error -o $pkg "$base/$($manifest.asset.name)"
+          $actual = (Get-FileHash $pkg -Algorithm SHA256).Hash
+          if ($actual -ne $manifest.asset.sha256.ToUpperInvariant()) {
+            throw "runtime checksum mismatch: $actual != $($manifest.asset.sha256)"
+          }
+
+          # The exact directory the app unpacks a downloaded runtime into, so the
+          # first launch finds a complete runtime and never touches the network.
+          $rt = "packages/desktop/release/EkkoStudio-Portable/data/web-ui/desktop-runtime/hermes/$($manifest.hermesAgentVersion)/$($manifest.platform)"
+          New-Item -ItemType Directory -Force -Path $rt | Out-Null
+          tar -xzf $pkg -C $rt
+
+          # Exactly what rootRuntimeReady() demands before the app will accept a
+          # directory as a usable runtime, so a layout change fails here rather
+          # than silently producing a "-full" that still wants to download.
+          foreach ($required in @("python/venv/Scripts/python.exe", "node/node.exe", "git/cmd/git.exe")) {
+            if (-not (Test-Path (Join-Path $rt $required))) { throw "bundled runtime is missing $required" }
+          }
+          if (-not (Test-Path "$rt/python/venv/Scripts/hermes.cmd") -and -not (Test-Path "$rt/python/venv/Scripts/hermes.exe")) {
+            throw "bundled runtime is missing the hermes launcher"
+          }
+          "bundled runtime: $($manifest.hermesAgentVersion) $($manifest.platform), $([math]::Round($manifest.asset.size / 1MB)) MB compressed"
+
+      - name: Package the folder
+        shell: pwsh
+        run: |
+          $release = (Resolve-Path packages/desktop/release).Path
+          $version = (Get-Content packages/desktop/package.json -Raw | ConvertFrom-Json).version
+          $zip = Join-Path $release "EkkoStudio-Portable${{ matrix.suffix }}-$version-win-x64.zip"
           if (Test-Path $zip) { Remove-Item $zip -Force }
 
           # Archive from the parent so stored names start at EkkoStudio-Portable/,
           # and with 7z rather than Compress-Archive: the unpacked Electron tree
           # routinely exceeds MAX_PATH, which the .NET zip writer refuses.
           Push-Location $release
-          try { 7z a -tzip -mx=5 (Split-Path $zip -Leaf) "EkkoStudio-Portable" } finally { Pop-Location }
+          try { 7z a -tzip -mx=${{ matrix.mx }} (Split-Path $zip -Leaf) "EkkoStudio-Portable" } finally { Pop-Location }
 
-          Get-ChildItem $folder -Name
           Get-Item $zip | Select-Object Name, Length
 
       - name: Verify the archive is self-contained
         shell: pwsh
         run: |
-          $zip = (Get-ChildItem packages/desktop/release/EkkoStudio-Portable-*-win-x64.zip).FullName
+          $zip = (Get-ChildItem packages/desktop/release/EkkoStudio-Portable*-win-x64.zip).FullName
           $names = 7z l -slt $zip |
             Select-String "^Path = " |
             ForEach-Object { $_.Line.Substring("Path = ".Length) -replace "\\", "/" } |
@@ -119,10 +180,18 @@ jobs:
           if ($stray) { throw "entries outside the program folder: $($stray -join ", ")" }
           "ok: every entry lives under EkkoStudio-Portable/"
 
+          # A -full archive that lost its runtime would silently behave like
+          # -slim, which is exactly the bug this assertion exists to catch.
+          if ("${{ matrix.suffix }}" -eq "-Full") {
+            $bundled = $names | Where-Object { $_ -like "EkkoStudio-Portable/data/web-ui/desktop-runtime/hermes/*/win-x64/node/node.exe" }
+            if (-not $bundled) { throw "the -full archive does not contain the bundled runtime" }
+            "ok: bundled runtime present ($bundled)"
+          }
+
       - name: Upload portable artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ekko-studio-portable-win-x64
-          path: packages/desktop/release/EkkoStudio-Portable-*-win-x64.zip
+          name: ekko-studio-portable${{ matrix.suffix }}-win-x64
+          path: packages/desktop/release/EkkoStudio-Portable${{ matrix.suffix }}-*-win-x64.zip
           if-no-files-found: error
           retention-days: 7

@@ -19,6 +19,11 @@ on:
         description: "Optional runtime release tag embedded into the build"
         required: false
         type: string
+      publish:
+        description: "Publish both zips as a GitHub Release"
+        required: false
+        type: boolean
+        default: false
   push:
     branches:
       # The portable work lives on main now. Building it there doubles as a
@@ -43,6 +48,10 @@ jobs:
   portable:
     name: Portable Windows x64 (${{ matrix.variant }})
     runs-on: windows-latest
+    # Both matrix legs read the same package.json, so whichever one GitHub
+    # reports as "last completed" carries the same value.
+    outputs:
+      version: ${{ steps.package.outputs.version }}
     strategy:
       fail-fast: false
       matrix:
@@ -147,10 +156,12 @@ jobs:
           "bundled runtime: $($manifest.hermesAgentVersion) $($manifest.platform), $([math]::Round($manifest.asset.size / 1MB)) MB compressed"
 
       - name: Package the folder
+        id: package
         shell: pwsh
         run: |
           $release = (Resolve-Path packages/desktop/release).Path
           $version = (Get-Content packages/desktop/package.json -Raw | ConvertFrom-Json).version
+          "version=$version" >> $env:GITHUB_OUTPUT
           $zip = Join-Path $release "EkkoStudio-Portable${{ matrix.suffix }}-$version-win-x64.zip"
           if (Test-Path $zip) { Remove-Item $zip -Force }
 
@@ -200,3 +211,45 @@ jobs:
           path: packages/desktop/release/EkkoStudio-Portable${{ matrix.suffix }}-*-win-x64.zip
           if-no-files-found: error
           retention-days: 7
+
+  release:
+    name: Publish the release
+    needs: portable
+    # Pushing to main stays artifacts-only; releasing is always explicit.
+    if: github.event_name == 'workflow_dispatch' && inputs.publish == true
+    runs-on: ubuntu-latest
+    permissions:
+      # The workflow default is contents: read.
+      contents: write
+
+    steps:
+      - name: Collect both zips
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ekko-studio-portable*
+          path: dist
+          merge-multiple: true
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.portable.outputs.version }}
+        run: |
+          set -euo pipefail
+          # <upstream version>.<year>.<MMDD>.<HHMM> in the maintainer's timezone:
+          # v0.7.33.2026.1011.1117
+          tag="v$VERSION.$(TZ=Asia/Shanghai date +%Y.%m%d.%H%M)"
+          cd dist
+          # The stamp goes into the file name too, or two builds of the same app
+          # version are indistinguishable once downloaded.
+          for f in *-win-x64.zip; do mv "$f" "${f/-$VERSION-/-$tag-}"; done
+          notes="便携版 Windows x64 构建 $tag
+
+          - EkkoStudio-Portable-$tag-win-x64.zip - 首次启动联网下载运行时（约 252 MiB）
+          - EkkoStudio-Portable-Full-$tag-win-x64.zip - 运行时已内置，可离线运行（约 862 MiB）
+
+          解压后运行 EkkoStudio-Portable/Ekko Studio.exe，数据写在同级 data/ 目录。"
+          gh release create "$tag" ./*.zip \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "$tag" --notes "$notes"
+          echo "released https://github.com/$GITHUB_REPOSITORY/releases/tag/$tag"

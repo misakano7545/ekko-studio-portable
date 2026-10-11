@@ -21,6 +21,9 @@ on:
         type: string
   push:
     branches:
+      # The portable work lives on main now. Building it there doubles as a
+      # canary: if an upstream merge ever breaks it, this fails on its own.
+      - main
       - "portable*"
 
 permissions:

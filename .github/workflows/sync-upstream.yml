@@ -1,0 +1,58 @@
+name: Sync upstream
+
+# Keeps this portable build level with EKKOLearnAI/ekko-studio (branch: main).
+#
+# Manual on purpose — no schedule. Upstream commits are replayed, never
+# rewritten, so main stays upstream/main plus our own portable commits, but our
+# patches sit on upstream's hottest desktop files (index.ts was changed in 51 of
+# upstream's last 1000 commits, paths.ts in 21), so a scheduled rebase would
+# conflict often, and a rebase conflict is not something CI can resolve.
+#
+# Rebased rather than merged: no merge commit, and every upstream SHA, author and
+# message survives verbatim. merge-upstream — the API behind GitHub's own "Sync
+# fork" button — cannot be used here: it only fast-forwards, and this repo is a
+# standalone copy, not a fork.
+#
+# shortcut: a rebase conflict stops the run (set -e); main is left untouched.
+# Resolve it locally, then push.
+#
+# Only main is synced. The other branches were upstream copies and were pruned.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          # Full history: the merge-base check below is meaningless on a shallow
+          # clone.
+          fetch-depth: 0
+
+      - name: Rebase main onto upstream
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/EKKOLearnAI/ekko-studio.git
+          git fetch --no-tags upstream main
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Already level with upstream/main."
+            exit 0
+          fi
+
+          before=$(git rev-parse HEAD)
+          git rebase upstream/main
+          # Explicit lease: the tracking ref may not exist in a fresh checkout.
+          git push --force-with-lease=main:"$before" origin HEAD:main
+          echo "Synced to $(git rev-parse --short upstream/main)."

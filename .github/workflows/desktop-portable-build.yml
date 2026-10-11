@@ -186,8 +186,10 @@ jobs:
           # A -full archive that lost its runtime would silently behave like
           # -slim, which is exactly the bug this assertion exists to catch.
           if ("${{ matrix.suffix }}" -eq "-Full") {
-            $bundled = $names | Where-Object { $_ -like "EkkoStudio-Portable/data/web-ui/desktop-runtime/hermes/*/win-x64/node/node.exe" }
-            if (-not $bundled) { throw "the -full archive does not contain the bundled runtime" }
+            # The app looks under the version in the archive's own runtime-release.json, so pin it: a wildcard here would let a mismatch ship and re-download the runtime on first launch.
+            $expected = (Get-Content packages/desktop/build/runtime-release.json -Raw | ConvertFrom-Json).hermesAgentVersion
+            $bundled = $names | Where-Object { $_ -like "EkkoStudio-Portable/data/web-ui/desktop-runtime/hermes/$expected/win-x64/node/node.exe" }
+            if (-not $bundled) { throw "the -full archive has no runtime under hermes/$expected" }
             "ok: bundled runtime present ($bundled)"
           }
 

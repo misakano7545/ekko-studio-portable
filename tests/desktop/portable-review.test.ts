@@ -1,6 +1,6 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { recordRuntimeActivationError, runtimeStorageRoot } from '../../packages/desktop/src/main/paths'
 import { configureDesktopIdentity, dataRootForPortableConfig } from '../../packages/desktop/src/main/desktop-identity'
@@ -105,5 +105,14 @@ describe('portable review findings', () => {
     writeFileSync(file, JSON.stringify({ schema: 1, runtimeRootDirectory: join(externalData, 'web-ui', 'desktop-runtime') }))
 
     expect(runtimeStorageRoot()).toBe(join(externalData, 'web-ui', 'desktop-runtime'))
+  })
+
+  it('greys out the tray login-item toggle and reports it off, instead of no-opping a click', () => {
+    const main = readFileSync(resolve('packages/desktop/src/main/index.ts'), 'utf8')
+
+    // Source-level because the tray template is built inside the Electron entry,
+    // which cannot be imported here. Matches how tray-icon.test.ts checks it.
+    expect(main).toMatch(/enabled: \(process\.platform !== 'linux' \|\| app\.isPackaged\) && !isPortableMode\(\),/)
+    expect(main).toMatch(/function getOpenAtLogin\(\): boolean \{\n(?:.*\n)*?\s*if \(isPortableMode\(\)\) return false/)
   })
 })

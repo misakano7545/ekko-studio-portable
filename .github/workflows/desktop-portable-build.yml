@@ -89,6 +89,11 @@ jobs:
       - name: Gate on the portable path logic
         run: npm run test -- tests/desktop/portable-paths.test.ts tests/desktop/portable-review.test.ts tests/desktop/desktop-identity.test.ts tests/desktop/runtime-paths.test.ts tests/desktop/runtime-config.test.ts
 
+      # The bundled runtime ships no bash.exe, so the agent's shell tools depend on
+      # this heal; a regression here is invisible until someone runs a terminal.
+      - name: Gate on the bundled bash heal
+        run: npm run test -- tests/server/agent-bridge-bundled-bash.test.ts
+
       - name: Build web UI
         run: npm run build
 
@@ -105,7 +110,19 @@ jobs:
         shell: bash
         env:
           RUNTIME_RELEASE_TAG: ${{ github.event.inputs.runtime_release_tag }}
-        run: npm --prefix packages/desktop run write:runtime-release
+          # The Hermes runtime this build ships. runtime-config.mjs reads this
+          # variable, so the pin lives here instead of in a patched default:
+          # nothing to conflict on when upstream bumps the runtime they point at.
+          # The three are atomic — hermesSource() refuses a version without its ref.
+          HERMES_VERSION: '0.21.5'
+          HERMES_SOURCE_REF: 'v2026.9.24'
+          HERMES_SOURCE_COMMIT: 'f97608f178d1ffeca59860195ab7da295f7c8e5f'
+        run: |
+          npm --prefix packages/desktop run write:runtime-release
+          # The app reads this manifest, so a silent fall back to the upstream
+          # default would ship the wrong runtime without failing anything.
+          actual=$(node -p "require('./packages/desktop/build/runtime-release.json').hermesAgentVersion")
+          [ "$actual" = "$HERMES_VERSION" ] || { echo "runtime-release.json says $actual, expected $HERMES_VERSION"; exit 1; }
 
       - name: Build unpacked app
         run: npm --prefix packages/desktop run dist -- --win --dir --x64 --publish never
@@ -156,6 +173,25 @@ jobs:
             throw "bundled runtime is missing the hermes launcher"
           }
           "bundled runtime: $($manifest.hermesAgentVersion) $($manifest.platform), $([math]::Round($manifest.asset.size / 1MB)) MB compressed"
+
+          # MinGit ships usr/bin/sh.exe (bash under another name) but no bash.exe, and
+          # Hermes only accepts a file named bash.exe: without one, every shell-backed
+          # agent tool fails with "Git Bash not found". This is the copy the app makes
+          # on its first agent spawn, so the shipped -full ends up with a bash too.
+          $bash = Join-Path $rt "git/usr/bin/bash.exe"
+          if (-not (Test-Path $bash)) { Copy-Item (Join-Path $rt "git/usr/bin/sh.exe") $bash }
+          $env:HERMES_GIT_BASH_PATH = $bash
+
+          Push-Location (Join-Path $rt "python")
+          try {
+            $probe = & (Join-Path $rt "python/venv/Scripts/python.exe") -c "import os,sys;sys.path.insert(0,os.getcwd());from tools.environments import local;b=local._find_bash();print(b);print(local._bash_starts(b));print(local._git_bash_bin_dirs())" 2>&1
+          } finally { Pop-Location }
+          $probe | ForEach-Object { Write-Host $_ }
+          if (-not ($probe -match "bash\.exe")) { throw "Hermes did not resolve the bundled bash.exe: $probe" }
+
+          $bashVersion = & $bash -lic 'echo $BASH_VERSION'
+          if (-not $bashVersion) { throw "the bundled bash.exe did not start" }
+          "ok: Hermes resolves the bundled bash ($bashVersion)"
 
       - name: Package the folder
         id: package

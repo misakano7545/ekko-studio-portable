@@ -188,10 +188,13 @@ jobs:
 
           Push-Location (Join-Path $rt "python")
           try {
-            $probe = & (Join-Path $rt "python/venv/Scripts/python.exe") -c "import os,sys;sys.path.insert(0,os.getcwd());from tools.environments import local;b=local._find_bash();print(b);print(local._bash_starts(b));print(local._git_bash_bin_dirs())" 2>&1
+            # Ask Hermes' own discovery, and let python decide pass or fail: matching
+            # its output for "bash.exe" would pass on a traceback that still printed
+            # the path before the call that broke.
+            $probe = & (Join-Path $rt "python/venv/Scripts/python.exe") -c "import os,sys;sys.path.insert(0,os.getcwd());from tools.environments import local;b=local._find_bash();ok=bool(b) and 'bash.exe' in b.lower() and local._bash_starts(b);print('find_bash:',b);print('starts:',local._bash_starts(b));print('git_bash_dirs:',local._git_bash_bin_dirs());sys.exit(0 if ok else 1)" 2>&1
           } finally { Pop-Location }
           $probe | ForEach-Object { Write-Host $_ }
-          if (-not ($probe -match "bash\.exe")) { throw "Hermes did not resolve the bundled bash.exe: $probe" }
+          if ($LASTEXITCODE -ne 0) { throw "the bundled runtime's Hermes cannot use its bash: $probe" }
 
           # -c, not -lic: MinGit's /etc/profile prints errors for the tools it does
           # not ship, and _bash_starts above already proved the shell starts.

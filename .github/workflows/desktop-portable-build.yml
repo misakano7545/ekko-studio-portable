@@ -188,6 +188,13 @@ jobs:
 
           Push-Location (Join-Path $rt "python")
           try {
+            # The shipped venv carries a relative `home`; the app rebases it to an
+            # absolute path on extraction (runtime-relocation.ts), so mirror that
+            # before asking the runtime to run — a venv launcher resolves a relative
+            # home against the current directory and cannot find its base.
+            $cfg = Join-Path $rt "python/venv/pyvenv.cfg"
+            (Get-Content $cfg) -replace '^\s*home\s*=.*$', "home = $rt\python\base" | Set-Content -Path $cfg
+
             # Ask Hermes' own discovery, and let python decide pass or fail: matching
             # its output for "bash.exe" would pass on a traceback that still printed
             # the path before the call that broke.

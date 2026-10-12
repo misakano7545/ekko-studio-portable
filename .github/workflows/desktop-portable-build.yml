@@ -163,6 +163,10 @@ jobs:
           New-Item -ItemType Directory -Force -Path $rt | Out-Null
           tar -xzf $pkg -C $rt
 
+          # & on a relative path makes PowerShell look for a module named after the
+          # first segment, so resolve the directory before invoking anything in it.
+          $rt = (Resolve-Path -LiteralPath $rt).Path
+
           # Exactly what rootRuntimeReady() demands before the app will accept a
           # directory as a usable runtime, so a layout change fails here rather
           # than silently producing a "-full" that still wants to download.
@@ -189,7 +193,9 @@ jobs:
           $probe | ForEach-Object { Write-Host $_ }
           if (-not ($probe -match "bash\.exe")) { throw "Hermes did not resolve the bundled bash.exe: $probe" }
 
-          $bashVersion = & $bash -lic 'echo $BASH_VERSION'
+          # -c, not -lic: MinGit's /etc/profile prints errors for the tools it does
+          # not ship, and _bash_starts above already proved the shell starts.
+          $bashVersion = & $bash -c 'echo $BASH_VERSION'
           if (-not $bashVersion) { throw "the bundled bash.exe did not start" }
           "ok: Hermes resolves the bundled bash ($bashVersion)"
 

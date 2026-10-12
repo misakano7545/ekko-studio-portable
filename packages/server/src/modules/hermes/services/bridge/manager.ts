@@ -1,7 +1,7 @@
 import { execFileSync, spawn, type ChildProcess } from 'child_process'
-import { existsSync } from 'fs'
+import { copyFileSync, existsSync } from 'fs'
 import { createConnection, createServer } from 'net'
-import { isAbsolute, join, resolve } from 'path'
+import { dirname, isAbsolute, join, resolve } from 'path'
 import { logger } from '../../../studio/public/logging'
 import { config } from '../../../studio/public/config'
 import { OPENROUTER_APP_HEADERS } from '../../../studio/public/openrouter-attribution'
@@ -94,9 +94,31 @@ function isLegacyGlobalDefaultEndpoint(endpoint: string): boolean {
     normalized === 'tcp://localhost:18765'
 }
 
+// Upstream's bundled MinGit ships usr/bin/sh.exe — the same binary as bash, just named sh —
+// but no bash.exe, and Hermes' Windows shell discovery only accepts a file named bash.exe.
+// Materialize it once and tell Hermes where it is; usr/bin stays off PATH on purpose, so
+// pointing at the file is the only route that does not reintroduce the GNU tools the desktop
+// app deliberately keeps away from PATH.
+function ensureBundledGitBash(agentRoot: string | undefined): string | undefined {
+  if (process.platform !== 'win32' || !agentRoot) return undefined
+  const bash = join(dirname(agentRoot), 'git', 'usr', 'bin', 'bash.exe')
+  if (existsSync(bash)) return bash
+  const sh = join(dirname(bash), 'sh.exe')
+  if (!existsSync(sh)) return undefined
+  try {
+    copyFileSync(sh, bash)
+    return bash
+  } catch (error) {
+    logger.warn('[agent-bridge] could not materialize %s: %s', bash, (error as Error).message)
+    return undefined
+  }
+}
+
 export function buildAgentBridgeProcessEnv(endpoint: string, hermesHome: string | undefined, agentRoot: string | undefined): NodeJS.ProcessEnv {
+  const gitBash = ensureBundledGitBash(agentRoot)
   const env: NodeJS.ProcessEnv = {
     ...process.env,
+    ...(gitBash ? { HERMES_GIT_BASH_PATH: gitBash } : {}),
     HERMES_AGENT_BRIDGE_ENDPOINT: endpoint,
     HERMES_HOME: hermesHome,
     // Shared Hermes YAML may have been rewritten by another Studio instance.

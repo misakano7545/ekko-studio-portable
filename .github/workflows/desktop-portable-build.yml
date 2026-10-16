@@ -114,9 +114,11 @@ jobs:
           # variable, so the pin lives here instead of in a patched default:
           # nothing to conflict on when upstream bumps the runtime they point at.
           # The three are atomic — hermesSource() refuses a version without its ref.
-          HERMES_VERSION: '0.21.5'
-          HERMES_SOURCE_REF: 'v2026.9.24'
-          HERMES_SOURCE_COMMIT: 'f97608f178d1ffeca59860195ab7da295f7c8e5f'
+          # 0.22.2 is a stamped release: its package metadata stays 0.0.0 and the
+          # version lives in install-stamp.json, so the source ref is the tag.
+          HERMES_VERSION: '0.22.2'
+          HERMES_SOURCE_REF: 'v0.22.2'
+          HERMES_SOURCE_COMMIT: 'd923a5eb487a17c0a68801bba9ef0f56c81040a8'
         run: |
           npm --prefix packages/desktop run write:runtime-release
           # The app reads this manifest, so a silent fall back to the upstream
@@ -197,14 +199,17 @@ jobs:
 
             # Ask Hermes' own discovery, and let python decide pass or fail: matching
             # its output for "bash.exe" would pass on a traceback that still printed
-            # the path before the call that broke.
-            $probe = & (Join-Path $rt "python/venv/Scripts/python.exe") -c "import os,sys;sys.path.insert(0,os.getcwd());from tools.environments import local;b=local._find_bash();ok=bool(b) and 'bash.exe' in b.lower() and local._bash_starts(b);print('find_bash:',b);print('starts:',local._bash_starts(b));print('git_bash_dirs:',local._git_bash_bin_dirs());sys.exit(0 if ok else 1)" 2>&1
+            # the path before the call that broke. _find_bash and _git_bash_bin_dirs
+            # are the two names that survived 0.22.2 moving shell discovery into
+            # pm.shell — that module start-tests each candidate itself, and drops
+            # local._bash_starts, so probe those two and nothing else.
+            $probe = & (Join-Path $rt "python/venv/Scripts/python.exe") -c "import os,sys;sys.path.insert(0,os.getcwd());from tools.environments import local;b=local._find_bash();ok=bool(b) and 'bash.exe' in b.lower();print('find_bash:',b);print('git_bash_dirs:',local._git_bash_bin_dirs());sys.exit(0 if ok else 1)" 2>&1
           } finally { Pop-Location }
           $probe | ForEach-Object { Write-Host $_ }
           if ($LASTEXITCODE -ne 0) { throw "the bundled runtime's Hermes cannot use its bash: $probe" }
 
           # -c, not -lic: MinGit's /etc/profile prints errors for the tools it does
-          # not ship, and _bash_starts above already proved the shell starts.
+          # not ship, and the probe above already asked Hermes to resolve this shell.
           $bashVersion = & $bash -c 'echo $BASH_VERSION'
           if (-not $bashVersion) { throw "the bundled bash.exe did not start" }
           "ok: Hermes resolves the bundled bash ($bashVersion)"
@@ -297,10 +302,15 @@ jobs:
           # The stamp goes into the file name too, or two builds of the same app
           # version are indistinguishable once downloaded.
           for f in *-win-x64.zip; do mv "$f" "${f/-$VERSION-/-$tag-}"; done
+          # Sizes come from the zips themselves: the runtime grows with each
+          # Hermes bump, so a hand-written number is wrong by the next release.
+          mib() { echo $(( ($(stat -c%s "$1") + 524288) / 1048576 )); }
+          slim_mib=$(mib "EkkoStudio-Portable-$tag-win-x64.zip")
+          full_mib=$(mib "EkkoStudio-Portable-Full-$tag-win-x64.zip")
           notes="便携版 Windows x64 构建 $tag
 
-          - EkkoStudio-Portable-$tag-win-x64.zip - 首次启动联网下载运行时（约 252 MiB）
-          - EkkoStudio-Portable-Full-$tag-win-x64.zip - 运行时已内置，可离线运行（约 862 MiB）
+          - EkkoStudio-Portable-$tag-win-x64.zip - 首次启动联网下载运行时（约 $slim_mib MiB）
+          - EkkoStudio-Portable-Full-$tag-win-x64.zip - 运行时已内置，可离线运行（约 $full_mib MiB）
 
           解压后运行 EkkoStudio-Portable/Ekko Studio.exe，数据写在同级 data/ 目录。"
           # Draft first, publish only once both zips are attached: a run killed

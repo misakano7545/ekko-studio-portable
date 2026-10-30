@@ -1,27 +1,37 @@
 name: Sync upstream
 
-# Keeps this portable build level with EKKOLearnAI/ekko-studio (branch: main).
+# Keeps this portable build level with EKKOLearnAI/ekko-studio (branch: main)
+# and releases the result, so a version bump upstream reaches users without
+# anyone touching this repo.
 #
-# Manual on purpose — no schedule. Upstream commits are replayed, never
-# rewritten, so main stays upstream/main plus our own portable commits, but our
-# patches sit on upstream's hottest desktop files (index.ts was changed in 51 of
-# upstream's last 1000 commits, paths.ts in 21), so a scheduled rebase would
-# conflict often, and a rebase conflict is not something CI can resolve.
+# Runs daily. Upstream commits are replayed, never rewritten, so main stays
+# upstream/main plus our own portable commits. Rebased rather than merged: no
+# merge commit, and every upstream SHA, author and message survives verbatim.
+# merge-upstream — the API behind GitHub's own "Sync fork" button — cannot be
+# used here: it only fast-forwards, and this repo is a standalone copy, not a
+# fork.
 #
-# Rebased rather than merged: no merge commit, and every upstream SHA, author and
-# message survives verbatim. merge-upstream — the API behind GitHub's own "Sync
-# fork" button — cannot be used here: it only fast-forwards, and this repo is a
-# standalone copy, not a fork.
+# The one thing CI cannot do is decide a conflict. Our portable guards sit on
+# the same lines upstream keeps adding its own guards to (DEVICE_INSTANCE_ENV),
+# so a sync that lands on those lines stops with the conflicting files in the
+# run summary, leaves main untouched, and waits for a human. Everything around
+# that — fetch, replay, push, build, tag, release — is automated.
 #
-# shortcut: a rebase conflict stops the run (set -e); main is left untouched.
-# Resolve it locally, then push.
+# shortcut: a rebase conflict fails the run (red, plus GitHub's scheduled-run
+# failure mail); main is left untouched. Resolve it locally, push, and the next
+# run carries on.
 #
 # Only main is synced. The other branches were upstream copies and were pruned.
 on:
+  schedule:
+    # 03:17 UTC = 11:17 Asia/Shanghai, before the working day.
+    - cron: '17 3 * * *'
   workflow_dispatch:
 
 permissions:
   contents: write
+  # Dispatching the build below.
+  actions: write
 
 concurrency:
   group: sync-upstream
@@ -39,6 +49,7 @@ jobs:
           fetch-depth: 0
 
       - name: Rebase main onto upstream
+        id: sync
         run: |
           set -euo pipefail
           git config user.name 'github-actions[bot]'
@@ -52,7 +63,40 @@ jobs:
           fi
 
           before=$(git rev-parse HEAD)
-          git rebase upstream/main
+          if ! git rebase upstream/main; then
+            {
+              echo "### 上游同步冲突，main 未改动"
+              echo
+              echo "冲突文件："
+              git diff --name-only --diff-filter=U | sed 's/^/- /'
+              echo
+              echo "本地 \`git rebase upstream/main\` 解冲突后 push 即可，下一次定时任务会接着走。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            git rebase --abort
+            exit 1
+          fi
           # Explicit lease: the tracking ref may not exist in a fresh checkout.
           git push --force-with-lease=main:"$before" origin HEAD:main
           echo "Synced to $(git rev-parse --short upstream/main)."
+
+          # A version bump is the only thing worth a new release; the tag carries
+          # a timestamp, so rebuilding the same version would just mint noise.
+          was=$(git show "$before:packages/desktop/package.json" | node -pe "JSON.parse(require('fs').readFileSync(0,'utf8')).version")
+          now=$(node -p "require('./packages/desktop/package.json').version")
+          echo "version: $was -> $now"
+          echo "synced=true" >> "$GITHUB_OUTPUT"
+          [ "$was" != "$now" ] && echo "version_changed=true" >> "$GITHUB_OUTPUT" || true
+          exit 0
+
+      # A push made with GITHUB_TOKEN starts no workflow, so the build has to be
+      # asked for. It runs either way: without a version bump it is the canary
+      # that would catch an upstream change breaking the portable build.
+      - name: Build, and release when the version moved
+        if: steps.sync.outputs.synced == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run desktop-portable-build.yml --ref main \
+            -f publish=${{ steps.sync.outputs.version_changed == 'true' }}
+          echo "dispatched the portable build (publish=${{ steps.sync.outputs.version_changed == 'true' }})"

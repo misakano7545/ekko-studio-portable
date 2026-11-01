@@ -110,21 +110,12 @@ jobs:
         shell: bash
         env:
           RUNTIME_RELEASE_TAG: ${{ github.event.inputs.runtime_release_tag }}
-          # The Hermes runtime this build ships. runtime-config.mjs reads this
-          # variable, so the pin lives here instead of in a patched default:
-          # nothing to conflict on when upstream bumps the runtime they point at.
-          # The three are atomic — hermesSource() refuses a version without its ref.
-          # 0.22.2 is a stamped release: its package metadata stays 0.0.0 and the
-          # version lives in install-stamp.json, so the source ref is the tag.
-          HERMES_VERSION: '0.22.2'
-          HERMES_SOURCE_REF: 'v0.22.2'
-          HERMES_SOURCE_COMMIT: 'd923a5eb487a17c0a68801bba9ef0f56c81040a8'
         run: |
           npm --prefix packages/desktop run write:runtime-release
-          # The app reads this manifest, so a silent fall back to the upstream
-          # default would ship the wrong runtime without failing anything.
-          actual=$(node -p "require('./packages/desktop/build/runtime-release.json').hermesAgentVersion")
-          [ "$actual" = "$HERMES_VERSION" ] || { echo "runtime-release.json says $actual, expected $HERMES_VERSION"; exit 1; }
+          # The build ships whatever this manifest says, and the manifest is
+          # generated from upstream's own default pin — so any diff here means a
+          # hand-edited version the app was not built against.
+          git diff --exit-code -- packages/desktop/build/runtime-release.json
 
       - name: Build unpacked app
         run: npm --prefix packages/desktop run dist -- --win --dir --x64 --publish never

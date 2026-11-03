@@ -1,0 +1,144 @@
+name: Sync upstream
+
+# Keeps this portable build level with EKKOLearnAI/ekko-studio (branch: main)
+# and releases the result, so a version bump upstream reaches users without
+# anyone touching this repo.
+#
+# Runs daily. Upstream commits are replayed, never rewritten, so main stays
+# upstream/main plus our own portable commits. Rebased rather than merged: no
+# merge commit, and every upstream SHA, author and message survives verbatim.
+# merge-upstream — the API behind GitHub's own "Sync fork" button — cannot be
+# used here: it only fast-forwards, and this repo is a standalone copy, not a
+# fork.
+#
+# The one thing CI cannot do is decide a conflict. Our portable guards sit on
+# the same lines upstream keeps adding its own guards to (DEVICE_INSTANCE_ENV),
+# so a sync that lands on those lines stops with the conflicting files in the
+# run summary, leaves main untouched, and waits for a human. Everything around
+# that — fetch, replay, push, build, tag, release — is automated.
+#
+# shortcut: a rebase conflict fails the run (red, plus GitHub's scheduled-run
+# failure mail); main is left untouched. Resolve it locally, push, and the next
+# run carries on.
+#
+# Only main is synced. The other branches were upstream copies and were pruned.
+on:
+  schedule:
+    # 03:17 UTC = 11:17 Asia/Shanghai, before the working day.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  # Dispatching the build below, and filing the conflict issue below.
+  actions: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          # Full history: the merge-base check below is meaningless on a shallow
+          # clone.
+          fetch-depth: 0
+
+      - name: Rebase main onto upstream
+        id: sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/EKKOLearnAI/ekko-studio.git
+          git fetch --no-tags upstream main
+
+          # A conflict resolved once should not need a human twice: rerere replays the
+          # recorded resolution when the same conflict comes back. The cache travels
+          # with the repo because every runner starts with an empty .git.
+          git config rerere.enabled true
+          mkdir -p .git/rr-cache
+          if [ -d .github/rerere ]; then cp -a .github/rerere/. .git/rr-cache/; fi
+
+          before=$(git rev-parse HEAD)
+          synced=false
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Already level with upstream/main."
+          else
+            if ! git rebase upstream/main; then
+              files=$(git diff --name-only --diff-filter=U | sed 's/^/- /')
+              {
+                echo "### 上游同步冲突，main 未改动"
+                echo
+                echo "冲突文件："
+                echo "$files"
+                echo
+                echo "本地 \`git rebase upstream/main\` 解冲突后 push 即可，下一次定时任务会接着走。"
+              } >> "$GITHUB_STEP_SUMMARY"
+              git rebase --abort
+              # Nobody is watching a scheduled run. File it as a work item instead of
+              # leaving the only trace in a failure mail.
+              body=$(printf 'main 未改动，同步停在冲突上。冲突文件：\n\n%s\n\n本地 `git rebase upstream/main` 解冲突后 push，下一次定时任务会接着走。\n' "$files")
+              existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search '"上游同步冲突" in:title' --json number --jq '.[0].number // empty')
+              if [ -n "$existing" ]; then
+                gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+              else
+                gh issue create --repo "$GITHUB_REPOSITORY" --title '上游同步冲突，待解' --body "$body"
+              fi
+              exit 1
+            fi
+            # Keep whatever rerere learned, so the next identical conflict resolves itself.
+            if [ -n "$(ls -A .git/rr-cache 2>/dev/null)" ]; then
+              mkdir -p .github/rerere && cp -a .git/rr-cache/. .github/rerere/
+              git add .github/rerere
+              # Nothing to record when the cache is unchanged; that must not block the push.
+              git commit -qm 'chore: record upstream conflict resolutions' || true
+            fi
+            # Explicit lease: the tracking ref may not exist in a fresh checkout.
+            git push --force-with-lease=main:"$before" origin HEAD:main
+            echo "Synced to $(git rev-parse --short upstream/main)."
+            synced=true
+          fi
+
+          was=$(git show "$before:packages/desktop/package.json" | node -pe "JSON.parse(require('fs').readFileSync(0,'utf8')).version")
+          now=$(node -p "require('./packages/desktop/package.json').version")
+          # A version with no release yet is owed one, whether or not main moved in
+          # this run. Without this, a build that failed (or a dispatch that did)
+          # is never retried: the next sync finds main already level, dispatches
+          # nothing, and that version stays unshipped until upstream bumps again.
+          released=$(gh release list --limit 200 --repo "$GITHUB_REPOSITORY" --json tagName \
+            --jq '.[].tagName' | awk -v v="v$now." 'index($0, v) == 1' | wc -l)
+          echo "version: $was -> $now (releases for $now: $released)"
+
+          # A version bump is the only thing worth a new release; the tag carries
+          # a timestamp, so rebuilding the same version would just mint noise.
+          dispatch=false
+          publish=false
+          if [ "$released" -eq 0 ]; then dispatch=true; publish=true
+          elif [ "$synced" = true ] && [ "$was" != "$now" ]; then dispatch=true; publish=true
+          elif [ "$synced" = true ]; then dispatch=true; fi
+          echo "dispatch=$dispatch publish=$publish" >> "$GITHUB_STEP_SUMMARY"
+          echo "dispatch=$dispatch" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+
+      # A push made with GITHUB_TOKEN starts no workflow, so the build has to be
+      # asked for. It runs either way: without a version bump it is the canary
+      # that would catch an upstream change breaking the portable build.
+      - name: Build, and release when the version moved
+        if: steps.sync.outputs.dispatch == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # --repo: the sync step left an `upstream` remote behind, and gh prefers
+          # a remote by that name, so without it this dispatches to EKKOLearnAI's repo (404).
+          gh workflow run desktop-portable-build.yml --repo "$GITHUB_REPOSITORY" --ref main \
+            -f publish=${{ steps.sync.outputs.publish == 'true' }}
+          echo "dispatched the portable build (publish=${{ steps.sync.outputs.publish }})"

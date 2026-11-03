@@ -1,3 +1,6 @@
+// Ours, so it stays off the upstream import block below: any line we edit in that
+// block is a line the daily upstream sync has to merge by hand.
+import { isPortableMode } from './portable'
 import './desktop-storage-bootstrap'
 import { activateDeviceWindow } from './device-window-activation'
 import { InstallationCoordinator } from './installation-coordinator'
@@ -422,6 +425,9 @@ function hasQuitRequest(data: unknown): boolean {
 }
 
 function getOpenAtLogin(): boolean {
+  // A portable copy manages no login item, and reading one would touch the very
+  // registry this copy exists to stay out of.
+  if (isPortableMode()) return false
   try {
     return readOpenAtLogin(app)
   } catch (error) {
@@ -431,6 +437,9 @@ function getOpenAtLogin(): boolean {
 }
 
 function setOpenAtLogin(openAtLogin: boolean) {
+  // An autostart entry would pin the drive letter this folder currently sits on,
+  // so it would break the moment the stick moves to another port.
+  if (isPortableMode()) return
   if (process.env[DEVICE_INSTANCE_ENV]) throw new Error('Manage startup from the primary Desktop instance')
   writeOpenAtLogin(app, openAtLogin)
 }
@@ -555,7 +564,9 @@ function updateTrayMenu() {
     {
       label: t('tray.openAtLogin'),
       type: 'checkbox',
-      enabled: process.platform !== 'linux' || app.isPackaged,
+      // Greyed out rather than hidden: the row stays discoverable, and a click
+      // could not do anything anyway — there is no login item to write.
+      enabled: (process.platform !== 'linux' || app.isPackaged) && !isPortableMode(),
       checked: getOpenAtLogin(),
       click: (item) => {
         try {
@@ -1039,7 +1050,9 @@ function updateSplash(progress: RuntimeProgress) {
 }
 
 async function installPackagedCommandShims(): Promise<void> {
-  if (!app.isPackaged) return
+  // These shims edit the user's PATH in the registry (HKCU) and drop launchers
+  // into the home directory — both outside a portable install by definition.
+  if (!app.isPackaged || isPortableMode()) return
 
   const installs = [
     installHermesStudioCliShim({
@@ -1100,10 +1113,12 @@ async function bootstrap(source?: RuntimeDownloadSource) {
   }
 
   try {
-    const legacyMigration = await migratePendingLegacyWindowsData()
-    if (legacyMigration.completed) {
+    // A portable install has no AppData state to migrate, and scanning for it
+    // would touch the very profile directories portable mode exists to avoid.
+    const legacyMigration = isPortableMode() ? null : await migratePendingLegacyWindowsData()
+    if (legacyMigration?.completed) {
       console.log('[desktop] migrated legacy Windows Hermes data before starting local services')
-    } else if (legacyMigration.retryPending) {
+    } else if (legacyMigration?.retryPending) {
       console.warn(`[desktop] legacy Windows Hermes data migration will retry on the next launch: ${legacyMigration.error || 'unknown error'}`)
     }
     await migratePendingRuntimeRoot(updateSplash)
@@ -1730,12 +1745,12 @@ async function runDesktopApp() {
     // default is fine there.
     if (process.platform !== 'darwin') Menu.setApplicationMenu(null)
     try {
-      if (!process.env[DEVICE_INSTANCE_ENV]) migrateWindowsLoginItem(app, APP_USER_MODEL_ID)
+      if (!isPortableMode() && !process.env[DEVICE_INSTANCE_ENV]) migrateWindowsLoginItem(app, APP_USER_MODEL_ID)
     } catch (error) {
       console.warn('[desktop] failed to migrate the Windows login item:', error)
     }
     try {
-      if (!process.env[DEVICE_INSTANCE_ENV]) refreshLinuxLoginItem(app)
+      if (!isPortableMode() && !process.env[DEVICE_INSTANCE_ENV]) refreshLinuxLoginItem(app)
     } catch (error) {
       console.warn('[desktop] failed to refresh the Linux login item:', error)
     }

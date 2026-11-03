@@ -2,6 +2,7 @@ import { app } from 'electron'
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { basename, dirname, join, relative, resolve } from 'node:path'
 import { homedir, platform } from 'node:os'
+import { sanitizeActiveRuntime } from './portable'
 import {
   resolveRuntimeResourceDir,
   runtimePlatformKey,
@@ -18,6 +19,8 @@ let incompleteActiveWebUiWarningPath = ''
 export function isPackaged() {
   return !!app?.isPackaged
 }
+
+export * from './portable'
 
 export function defaultWebuiDir(): string {
   if (isPackaged()) return resolve(process.resourcesPath, 'webui')
@@ -137,7 +140,8 @@ function readActiveRuntimeVersion(): ActiveRuntimeVersion | null {
   const file = activeRuntimeVersionFile()
   if (!existsSync(file)) return null
   try {
-    return JSON.parse(readFileSync(file, 'utf-8')) as ActiveRuntimeVersion
+    const active = JSON.parse(readFileSync(file, 'utf-8')) as ActiveRuntimeVersion
+    return sanitizeActiveRuntime(active)
   } catch {
     return null
   }

@@ -1,0 +1,313 @@
+name: Portable Desktop Build
+
+# Debug loop for the green/portable build: push to a portable* branch (or run it
+# by hand), download the zip from the run artifacts, unzip it anywhere on a
+# Windows box and launch the exe. There is no installer and no release: this job
+# only produces the folder-in-a-zip artifacts.
+#
+# Two variants, same app code — build-config only:
+#   slim  the app downloads the ~536MB runtime into data/ on first launch.
+#   full  the runtime is already inside data/, so it runs with no network at all.
+# They differ by one step and one compression level; the folder layout is
+# identical, so whichever zip a user unzips, the marker and data root are the
+# same `data/` directory next to the exe.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runtime_release_tag:
+        description: "Optional runtime release tag embedded into the build"
+        required: false
+        type: string
+      publish:
+        description: "Publish both zips as a GitHub Release"
+        required: false
+        type: boolean
+        default: false
+  push:
+    branches:
+      # The portable work lives on main now. Building it there doubles as a
+      # canary: if an upstream merge ever breaks it, this fails on its own.
+      - main
+      - "portable*"
+
+permissions:
+  contents: read
+
+concurrency:
+  # Keyed on the event too: a push to main must never cancel a run that is
+  # mid-publish. Duplicate pushes still cancel each other.
+  group: desktop-portable-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+env:
+  # Must match DEFAULT_RUNTIME_GITHUB_REPO in
+  # packages/desktop/src/main/runtime-manager.ts, which is where the app itself
+  # would fetch a runtime from.
+  RUNTIME_REPO: EKKOLearnAI/ekko-studio
+
+jobs:
+  portable:
+    name: Portable Windows x64 (${{ matrix.variant }})
+    runs-on: windows-latest
+    # Both matrix legs read the same package.json, so whichever one GitHub
+    # reports as "last completed" carries the same value.
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: slim
+            suffix: ""
+            # Source plus a built web UI, so worth compressing.
+            mx: 5
+          - variant: full
+            suffix: "-Full"
+            # ~1.5GB of already-compressed binaries: deflate has nothing left to
+            # squeeze, and -mx=5 would spend minutes to save a few percent.
+            mx: 1
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            packages/desktop/package-lock.json
+
+      - name: Install web UI dependencies
+        run: |
+          npm ci --ignore-scripts
+          npm rebuild node-pty
+
+      - name: Gate on the portable path logic
+        run: npm run test -- --config vitest.portable.config.ts
+
+      # The bundled runtime ships no bash.exe, so the agent's shell tools depend on
+      # this heal; a regression here is invisible until someone runs a terminal.
+      - name: Gate on the bundled bash heal
+        run: npm run test -- tests/server/agent-bridge-bundled-bash.test.ts
+
+      - name: Build web UI
+        run: npm run build
+
+      - name: Keep production web UI dependencies only
+        run: npm prune --omit=dev --no-audit --no-fund
+
+      - name: Verify image processing runtime
+        run: npm run verify:sharp-runtime
+
+      - name: Install desktop dependencies
+        run: npm ci --prefix packages/desktop --no-audit --no-fund
+
+      - name: Write runtime release metadata
+        shell: bash
+        env:
+          RUNTIME_RELEASE_TAG: ${{ github.event.inputs.runtime_release_tag }}
+        run: |
+          npm --prefix packages/desktop run write:runtime-release
+          # The build ships whatever this manifest says, and the manifest is
+          # generated from upstream's own default pin — so any diff here means a
+          # hand-edited version the app was not built against.
+          git diff --exit-code -- packages/desktop/build/runtime-release.json
+
+      - name: Build unpacked app
+        run: npm --prefix packages/desktop run dist -- --win --dir --x64 --publish never
+
+      - name: Assemble the green folder
+        shell: pwsh
+        run: |
+          $release = (Resolve-Path packages/desktop/release).Path
+          $folder = Join-Path $release "EkkoStudio-Portable"
+
+          if (Test-Path $folder) { Remove-Item $folder -Recurse -Force }
+          Move-Item (Join-Path $release "win-unpacked") $folder
+
+          # This directory is the portable marker: isPortableMode() looks for
+          # `data/` next to the exe and redirects every write below it.
+          New-Item -ItemType Directory -Force -Path (Join-Path $folder "data") | Out-Null
+          Set-Content -Path (Join-Path $folder "data/.keep") `
+            -Value "This folder is what makes Ekko Studio portable. Everything the app writes stays here."
+
+      - name: Bundle the Hermes runtime
+        if: matrix.variant == 'full'
+        shell: pwsh
+        run: |
+          $release = Get-Content packages/desktop/build/runtime-release.json -Raw | ConvertFrom-Json
+          $base = "https://github.com/$env:RUNTIME_REPO/releases/download/$($release.tag)"
+          $manifest = Invoke-RestMethod "$base/hermes-runtime-win-x64.json"
+
+          $pkg = Join-Path $env:RUNNER_TEMP $manifest.asset.name
+          curl.exe -L --fail --silent --show-error -o $pkg "$base/$($manifest.asset.name)"
+          $actual = (Get-FileHash $pkg -Algorithm SHA256).Hash
+          if ($actual -ne $manifest.asset.sha256.ToUpperInvariant()) {
+            throw "runtime checksum mismatch: $actual != $($manifest.asset.sha256)"
+          }
+
+          # The exact directory the app unpacks a downloaded runtime into, so the
+          # first launch finds a complete runtime and never touches the network.
+          $rt = "packages/desktop/release/EkkoStudio-Portable/data/web-ui/desktop-runtime/hermes/$($manifest.hermesAgentVersion)/$($manifest.platform)"
+          New-Item -ItemType Directory -Force -Path $rt | Out-Null
+          tar -xzf $pkg -C $rt
+
+          # & on a relative path makes PowerShell look for a module named after the
+          # first segment, so resolve the directory before invoking anything in it.
+          $rt = (Resolve-Path -LiteralPath $rt).Path
+
+          # Exactly what rootRuntimeReady() demands before the app will accept a
+          # directory as a usable runtime, so a layout change fails here rather
+          # than silently producing a "-full" that still wants to download.
+          foreach ($required in @("python/venv/Scripts/python.exe", "node/node.exe", "git/cmd/git.exe")) {
+            if (-not (Test-Path (Join-Path $rt $required))) { throw "bundled runtime is missing $required" }
+          }
+          if (-not (Test-Path "$rt/python/venv/Scripts/hermes.cmd") -and -not (Test-Path "$rt/python/venv/Scripts/hermes.exe")) {
+            throw "bundled runtime is missing the hermes launcher"
+          }
+          "bundled runtime: $($manifest.hermesAgentVersion) $($manifest.platform), $([math]::Round($manifest.asset.size / 1MB)) MB compressed"
+
+          # MinGit ships usr/bin/sh.exe (bash under another name) but no bash.exe, and
+          # Hermes only accepts a file named bash.exe: without one, every shell-backed
+          # agent tool fails with "Git Bash not found". This is the copy the app makes
+          # on its first agent spawn, so the shipped -full ends up with a bash too.
+          $bash = Join-Path $rt "git/usr/bin/bash.exe"
+          if (-not (Test-Path $bash)) { Copy-Item (Join-Path $rt "git/usr/bin/sh.exe") $bash }
+          $env:HERMES_GIT_BASH_PATH = $bash
+
+          Push-Location (Join-Path $rt "python")
+          try {
+            # The shipped venv carries a relative `home`; the app rebases it to an
+            # absolute path on extraction (runtime-relocation.ts), so mirror that
+            # before asking the runtime to run — a venv launcher resolves a relative
+            # home against the current directory and cannot find its base.
+            $cfg = Join-Path $rt "python/venv/pyvenv.cfg"
+            (Get-Content $cfg) -replace '^\s*home\s*=.*$', "home = $rt\python\base" | Set-Content -Path $cfg
+
+            # Ask Hermes' own discovery, and let python decide pass or fail: matching
+            # its output for "bash.exe" would pass on a traceback that still printed
+            # the path before the call that broke. _find_bash and _git_bash_bin_dirs
+            # are the two names that survived 0.22.2 moving shell discovery into
+            # pm.shell — that module start-tests each candidate itself, and drops
+            # local._bash_starts, so probe those two and nothing else.
+            $probe = & (Join-Path $rt "python/venv/Scripts/python.exe") -c "import os,sys;sys.path.insert(0,os.getcwd());from tools.environments import local;b=local._find_bash();ok=bool(b) and 'bash.exe' in b.lower();print('find_bash:',b);print('git_bash_dirs:',local._git_bash_bin_dirs());sys.exit(0 if ok else 1)" 2>&1
+          } finally { Pop-Location }
+          $probe | ForEach-Object { Write-Host $_ }
+          if ($LASTEXITCODE -ne 0) { throw "the bundled runtime's Hermes cannot use its bash: $probe" }
+
+          # -c, not -lic: MinGit's /etc/profile prints errors for the tools it does
+          # not ship, and the probe above already asked Hermes to resolve this shell.
+          $bashVersion = & $bash -c 'echo $BASH_VERSION'
+          if (-not $bashVersion) { throw "the bundled bash.exe did not start" }
+          "ok: Hermes resolves the bundled bash ($bashVersion)"
+
+      - name: Package the folder
+        id: package
+        shell: pwsh
+        run: |
+          $release = (Resolve-Path packages/desktop/release).Path
+          $version = (Get-Content packages/desktop/package.json -Raw | ConvertFrom-Json).version
+          "version=$version" >> $env:GITHUB_OUTPUT
+          $zip = Join-Path $release "EkkoStudio-Portable${{ matrix.suffix }}-$version-win-x64.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+
+          # Archive from the parent so stored names start at EkkoStudio-Portable/,
+          # and with 7z rather than Compress-Archive: the unpacked Electron tree
+          # routinely exceeds MAX_PATH, which the .NET zip writer refuses.
+          Push-Location $release
+          try { 7z a -tzip -mx=${{ matrix.mx }} (Split-Path $zip -Leaf) "EkkoStudio-Portable" } finally { Pop-Location }
+
+          Get-Item $zip | Select-Object Name, Length
+
+      - name: Verify the archive is self-contained
+        shell: pwsh
+        run: |
+          $zip = (Get-ChildItem packages/desktop/release/EkkoStudio-Portable*-win-x64.zip).FullName
+          $names = 7z l -slt $zip |
+            Select-String "^Path = " |
+            ForEach-Object { $_.Line.Substring("Path = ".Length) -replace "\\", "/" } |
+            Where-Object { $_ -and $_ -notlike "*.zip" }
+          "archive entries: $($names.Count)"
+
+          # The app only stays portable while the exe and the data directory are
+          # siblings inside one top-level folder.
+          foreach ($required in @("EkkoStudio-Portable/Ekko Studio.exe", "EkkoStudio-Portable/data/.keep")) {
+            if ($names -notcontains $required) { throw "portable archive is missing $required" }
+            "ok: $required"
+          }
+          # 7z also records the top-level folder itself, without a trailing slash.
+          $stray = $names | Where-Object { $_ -ne "EkkoStudio-Portable" -and $_ -notlike "EkkoStudio-Portable/*" }
+          if ($stray) { throw "entries outside the program folder: $($stray -join ", ")" }
+          "ok: every entry lives under EkkoStudio-Portable/"
+
+          # A -full archive that lost its runtime would silently behave like
+          # -slim, which is exactly the bug this assertion exists to catch.
+          if ("${{ matrix.suffix }}" -eq "-Full") {
+            # The app looks under the version in the archive's own runtime-release.json, so pin it: a wildcard here would let a mismatch ship and re-download the runtime on first launch.
+            $expected = (Get-Content packages/desktop/build/runtime-release.json -Raw | ConvertFrom-Json).hermesAgentVersion
+            $bundled = $names | Where-Object { $_ -like "EkkoStudio-Portable/data/web-ui/desktop-runtime/hermes/$expected/win-x64/node/node.exe" }
+            if (-not $bundled) { throw "the -full archive has no runtime under hermes/$expected" }
+            "ok: bundled runtime present ($bundled)"
+          }
+
+      - name: Upload portable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ekko-studio-portable${{ matrix.suffix }}-win-x64
+          path: packages/desktop/release/EkkoStudio-Portable${{ matrix.suffix }}-*-win-x64.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish the release
+    needs: portable
+    # Pushing to main stays artifacts-only; releasing is always explicit.
+    if: github.event_name == 'workflow_dispatch' && inputs.publish == true
+    runs-on: ubuntu-latest
+    permissions:
+      # The workflow default is contents: read.
+      contents: write
+
+    steps:
+      - name: Collect both zips
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ekko-studio-portable*
+          path: dist
+          merge-multiple: true
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.portable.outputs.version }}
+        run: |
+          set -euo pipefail
+          # <upstream version>.<year>.<MMDD>.<HHMM> in the maintainer's timezone:
+          # v0.7.33.2026.1011.1117
+          tag="v$VERSION.$(TZ=Asia/Shanghai date +%Y.%m%d.%H%M)"
+          cd dist
+          # The stamp goes into the file name too, or two builds of the same app
+          # version are indistinguishable once downloaded.
+          for f in *-win-x64.zip; do mv "$f" "${f/-$VERSION-/-$tag-}"; done
+          # Sizes come from the zips themselves: the runtime grows with each
+          # Hermes bump, so a hand-written number is wrong by the next release.
+          mib() { echo $(( ($(stat -c%s "$1") + 524288) / 1048576 )); }
+          slim_mib=$(mib "EkkoStudio-Portable-$tag-win-x64.zip")
+          full_mib=$(mib "EkkoStudio-Portable-Full-$tag-win-x64.zip")
+          notes="便携版 Windows x64 构建 $tag
+
+          - EkkoStudio-Portable-$tag-win-x64.zip - 首次启动联网下载运行时（约 $slim_mib MiB）
+          - EkkoStudio-Portable-Full-$tag-win-x64.zip - 运行时已内置，可离线运行（约 $full_mib MiB）
+
+          解压后运行 EkkoStudio-Portable/Ekko Studio.exe，数据写在同级 data/ 目录。"
+          # Draft first, publish only once both zips are attached: a run killed
+          # mid-upload leaves an invisible draft, not a half-full release.
+          gh release create "$tag" ./*.zip --draft \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "$tag" --notes "$notes"
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false
+          echo "released https://github.com/$GITHUB_REPOSITORY/releases/tag/$tag"

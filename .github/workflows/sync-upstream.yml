@@ -48,6 +48,12 @@ jobs:
           # Full history: the merge-base check below is meaningless on a shallow
           # clone.
           fetch-depth: 0
+          # Upstream edits its own workflows, and GITHUB_TOKEN is refused for any
+          # push that changes .github/workflows — no `permissions:` key grants that
+          # (it is not in the schema). So the push needs a token that carries the
+          # Workflows permission; without the secret this falls back to the plain
+          # token, and a sync that happens to carry a workflow change fails loudly.
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
 
       - name: Rebase main onto upstream
         id: sync
@@ -102,7 +108,15 @@ jobs:
               git commit -qm 'chore: record upstream conflict resolutions' || true
             fi
             # Explicit lease: the tracking ref may not exist in a fresh checkout.
-            git push --force-with-lease=main:"$before" origin HEAD:main
+            # Retried: GitHub answered one of these pushes with a 500, and a lost
+            # push costs a whole day — the ref is untouched either way, so a retry
+            # is safe. A permission refusal just burns three attempts.
+            tries=0
+            until git push --force-with-lease=main:"$before" origin HEAD:main; do
+              tries=$((tries + 1))
+              if [ "$tries" -ge 3 ]; then echo 'push failed 3 times'; exit 1; fi
+              sleep $((tries * 15))
+            done
             echo "Synced to $(git rev-parse --short upstream/main)."
             synced=true
           fi
